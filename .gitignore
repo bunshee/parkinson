@@ -1,3 +1,2 @@
-#ignore data and output_data folders
 data/
-output_data/
+data_output/
