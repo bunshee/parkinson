@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import numpy as np
-
+import pandas as pd
 class Graph():
     def __init__(self, layout='openpose', strategy='spatial'):
         self.get_edge(layout)
@@ -86,17 +85,6 @@ class Graph():
                 Dn[i, i] = Dl[i]**(-1)
         AD = np.dot(A, Dn)
         return AD
-def normalize_digraph(A):
-    Dl = np.sum(A, 0)
-    num_node = A.shape[0]
-    Dn = np.zeros((num_node, num_node))
-    for i in range(num_node):
-        if Dl[i] > 0:
-            Dn[i, i] = Dl[i]**(-1)
-    AD = np.dot(A, Dn)
-    return AD
-
-
 class ConvTemporalGraphical(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, t_kernel_size=1, t_stride=1, t_padding=0, t_dilation=1, bias=True):
         super().__init__()
@@ -157,7 +145,8 @@ class STGCN(nn.Module):
         temporal_kernel_size = 9
         kernel_size = (temporal_kernel_size, spatial_kernel_size)
         
-        self.data_bn = nn.BatchNorm1d(in_channels * A.size(1))
+        # Replace BatchNorm with GroupNorm
+        self.data_bn = nn.GroupNorm(num_groups=4, num_channels=in_channels * A.size(1))
         
         self.st_gcn_networks = nn.ModuleList((
             STGCNBlock(in_channels, 64, kernel_size, stride=1, residual=False),
@@ -199,107 +188,117 @@ class STGCN(nn.Module):
 
 
 class ParkinsonsDetectionModel(nn.Module):
-    def __init__(self, in_channels, graph_args, edge_importance_weighting, **kwargs):
+    def __init__(self, in_channels, num_frames, graph_args, edge_importance_weighting, **kwargs):
         super().__init__()
         self.st_gcn = STGCN(in_channels, graph_args, edge_importance_weighting, **kwargs)
-        self.angle_embedding = nn.Embedding(3, 64)  # 3 angles, embedding size 64
-        self.fc1 = nn.Linear(256 + 64, 128)
+        self.angle_embedding = nn.Embedding(3, 64)  # 3 angles (0, 90, 180), embedding size 64
+        self.fc1 = nn.Linear(256 * num_frames + 64, 128)  # Adjusted for multiple frames
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 1)  # Binary classification
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, x, angle):
-        x = self.st_gcn(x)
-        angle_embed = self.angle_embedding(angle).squeeze(1)
+        # x shape: (batch_size, in_channels, num_frames, num_joints)
+        batch_size = x.size(0)
+        x = self.st_gcn(x)  # shape: (batch_size, 256, num_frames, num_joints)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(batch_size, -1)  # shape: (batch_size, 256 * num_frames)
+        
+        angle = torch.div(angle, 90, rounding_mode='floor').long()  # Convert angles to 0, 1, 2
+        angle_embed = self.angle_embedding(angle)  # shape: (batch_size, 64)
+        
         combined = torch.cat([x, angle_embed], dim=1)
         x = F.relu(self.fc1(combined))
         x = self.dropout(x)
         x = F.relu(self.fc2(x))
         x = self.dropout(x)
         x = self.fc3(x)
-        return torch.sigmoid(x)  # Sigmoid for binary classification
-
-
-# Example usage
-graph_args = {'layout': 'openpose', 'strategy': 'spatial'}
-model = ParkinsonsDetectionModel(in_channels=2, graph_args=graph_args, edge_importance_weighting=True)
-
-# Example input
-batch_size = 2
-num_channels = 2  # X and Y coordinates
-num_frames = 300
-num_joints = 18
-x = torch.randn(batch_size, num_channels, num_frames, num_joints)
-angle = torch.LongTensor([0, 1])  # Example angles for each sample in the batch
-
-# Forward pass
-output = model(x, angle)
-print(output.shape)  # Should be [batch_size, 1]
-import pandas as pd
-import ast
+        return x.squeeze(-1)  # Remove the last dimension if it's 1
 # Load the CSV file
 df = pd.read_csv("../output_data/output_2D.csv")
 
 # Convert the vector column from string to numpy array
 df['vector'] = df['vector'].apply(eval).apply(np.array)
 
-df
-#get max length of the vectors
-max_length = df['vector'].apply(len).max()
+def prepare_sequence_data(df, num_frames_per_action):
+    # Assuming df['vector'] contains lists of pose data for each frame
+    sequence_data = []
+    sequence_angles = []
+    sequence_labels = []
+    
+    for i in range(0, len(df), num_frames_per_action):
+        # Get num_frames_per_action frames
+        action_sequence = df['vector'].iloc[i:i+num_frames_per_action].tolist()
+        
+        # Pad sequence if it's shorter than num_frames_per_action
+        if len(action_sequence) < num_frames_per_action:
+            action_sequence += [action_sequence[-1]] * (num_frames_per_action - len(action_sequence))
+        
+        # Convert to numpy array
+        action_sequence = np.array(action_sequence)
+        
+        # Reshape to (C, T, V) format
+        action_sequence = action_sequence.transpose(1, 0, 2)
+        
+        sequence_data.append(action_sequence)
+        
+        # Use the angle and label from the first frame of the sequence
+        sequence_angles.append(df['angle'].iloc[i])
+        sequence_labels.append(df['parkinson'].iloc[i])
+    
+    return np.array(sequence_data), np.array(sequence_angles), np.array(sequence_labels)
 
-# Pad the vectors to the max length
-df['vector'] = df['vector'].apply(lambda x: np.pad(x, ((0, max_length - len(x)), (0, 0))))
-df
-def parse_vector(vector):
-    vector_array = np.array(vector)
-    # Ensure we have at least 18 joints with 2 coordinates each
-    if vector_array.shape[0] < 18 or vector_array.shape[1] < 2:
-        padded = np.zeros((18, max(vector_array.shape[1], 2)))
-        padded[:vector_array.shape[0], :vector_array.shape[1]] = vector_array
-        return padded
-    return vector_array
-# Parse and stack the pose data
-pose_data = np.stack(df['vector'].apply(parse_vector).values)
+# Usage:
+num_frames_per_action = 160  # Adjust this based on your data
+pose_data, angles, labels = prepare_sequence_data(df, num_frames_per_action)
 
-# Reshape to [N, C, T, V]
-N, V, C = pose_data.shape
-T = 1  # Assuming each sample is a single frame
-pose_data = pose_data.transpose(0, 2, 1).reshape(N, C, T, V)
-
-print("Pose data shape after reshaping:", pose_data.shape)
-
-# Convert to torch tensors
 pose_data_tensor = torch.FloatTensor(pose_data)
-angles_tensor = torch.LongTensor(df['angle'].values)
-labels_tensor = torch.FloatTensor(df['parkinson'].values)
+angles_tensor = torch.LongTensor(angles)
+labels_tensor = torch.FloatTensor(labels)
 
-print("Final pose data tensor shape:", pose_data_tensor.shape)
-print("Angles shape:", angles_tensor.shape)
-print("Labels shape:", labels_tensor.shape)
-print("Pose data shape:", pose_data_tensor.shape)
+print("pose_data_tensor shape:", pose_data_tensor.shape)
+print("angles_tensor shape:", angles_tensor.shape)
+print("labels_tensor shape:", labels_tensor.shape)
 graph_args = {'layout': 'openpose', 'strategy': 'spatial'}
 in_channels = pose_data_tensor.shape[1]
-model = ParkinsonsDetectionModel(in_channels=in_channels, graph_args=graph_args, edge_importance_weighting=True)
+model = ParkinsonsDetectionModel(in_channels=2, num_frames=num_frames_per_action, graph_args=graph_args, edge_importance_weighting=True)
 
-in_channels
-# If you have a GPU available, move the model and data to GPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 pose_data_tensor = pose_data_tensor.to(device)
 angles_tensor = angles_tensor.to(device)
 labels_tensor = labels_tensor.to(device)
-
-device
-criterion = nn.BCELoss()  # Binary Cross Entropy for binary classification
+criterion = nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss instead of BCELoss
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+num_epochs = 3
+batch_size = 10  # or whatever size works for your memory constraints
 
-# Training loop (example for one epoch)
-model.train()
-optimizer.zero_grad()
-outputs = model(pose_data_tensor, angles_tensor)
-loss = criterion(outputs.squeeze(), labels_tensor)
-loss.backward()
-optimizer.step()
 
-print("Loss:", loss.item())
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    for i in range(0, pose_data_tensor.size(0), batch_size):
+        # Get batch
+        batch_pose = pose_data_tensor[i:i+batch_size]
+        batch_angles = angles_tensor[i:i+batch_size]
+        batch_labels = labels_tensor[i:i+batch_size]
 
+        # Forward pass
+        outputs = model(batch_pose, batch_angles)
+        loss = criterion(outputs, batch_labels)
+
+        # Backward pass and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / (pose_data_tensor.size(0) // batch_size)
+    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
+# For inference:
+model.eval()
+with torch.no_grad():
+    outputs = model(pose_data_tensor, angles_tensor)
+    predicted = (outputs.squeeze() > 0.5).float()  # Threshold at 0.5 for binary classification
+    accuracy = (predicted == labels_tensor).float().mean()
+    print("Accuracy:", accuracy.item())
